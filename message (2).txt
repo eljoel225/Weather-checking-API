@@ -1,0 +1,259 @@
+import asyncio
+import sys
+import requests
+import discord
+from datetime import datetime, timedelta, timezone
+from discord import File
+from discord.ext import tasks, commands
+from discord import app_commands
+import os
+import tempfile
+import re
+import time
+from PIL import Image, UnidentifiedImageError
+from io import BytesIO
+
+# Windows async event loop fix
+if sys.platform.startswith('win') and sys.version_info >= (3, 8):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# Set the TOKEN directly here
+TOKEN = "example"  # replace with your actual token
+
+# Create the bot instance
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Channel IDs
+OUTLOOK_CHANNEL_ID = 1361540379467583598
+WARNING_CHANNEL_ID = 1362496047993192668
+
+# SPC Outlook configuration
+risk_icons = {
+    "Marginal": ("⚠️", 0xFFFF00),
+    "Slight": ("⛈️", 0xFFCC00),
+    "Enhanced": ("🟠", 0xFFA500),
+    "Moderate": ("🔴", 0xFF0000),
+    "High": ("🟣", 0x800080)
+}
+
+day_data = {
+    "Day 1": {"text": "https://www.spc.noaa.gov/products/outlook/day1otlk.txt", "image": "https://www.spc.noaa.gov/products/outlook/day1otlk_0730.gif"},
+    "Day 2": {"text": "https://www.spc.noaa.gov/products/outlook/day2otlk.txt", "image": "https://www.spc.noaa.gov/products/outlook/day2otlk_0730.gif"},
+    "Day 3": {"text": "https://www.spc.noaa.gov/products/outlook/day3otlk.txt", "image": "https://www.spc.noaa.gov/products/outlook/day3otlk_0730.gif"}
+}
+
+sent_outlooks = {}
+sent_warning_ids = set()
+
+IMPORTANT_WARNINGS = [
+    'Tornado Emergency',
+    'Tornado Warning',
+    'Severe Thunderstorm Warning',
+    'Winter Storm Warning',
+    'Flash Flood Warning',
+    'Hurricane Warning',
+    'Extreme Cold Warning',
+    'Heat Warning'
+]
+
+def fetch_active_alerts():
+    try:
+        resp = requests.get("https://api.weather.gov/alerts/active", timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get('features', [])
+    except Exception as e:
+        print(f"An error occurred while fetching active alerts: {e}")
+    return []
+
+def check_recent(alert_time):
+    try:
+        dt = datetime.fromisoformat(alert_time.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        return dt >= now - timedelta(hours=3)
+    except Exception as e:
+        print(f"Error parsing alert time: {e}")
+        return False
+
+def get_spc_image_url(day_key: str):
+    base = "https://www.spc.noaa.gov/products/outlook/"
+    mapping = {
+        "Day 1": "day1otlk_0730.gif",
+        "Day 2": "day2otlk_0730.gif",
+        "Day 3": "day3otlk_0730.gif",
+    }
+    suffix = mapping.get(day_key)
+    return base + suffix if suffix else None
+
+def fetch_with_retry(url, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                return resp
+            else:
+                print(f"[DEBUG] Failed to fetch {url}, status: {resp.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"[DEBUG] Error fetching {url}: {e}")
+        time.sleep(delay)
+    return None
+
+def fetch_radar_image(alert):
+    radar_url = "https://radar.weather.gov/ridge/standard/K" + alert['properties'].get('geocode', {}).get('SAME', [''])[0][:3] + "_loop.gif"
+    try:
+        response = requests.get(radar_url, timeout=10)
+        if response.status_code == 200 and 'image' in response.headers.get('Content-Type', ''):
+            try:
+                img = Image.open(BytesIO(response.content))
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.gif') as tmp:
+                    img.save(tmp, format='GIF')
+                    return tmp.name
+            except UnidentifiedImageError:
+                print(f"[DEBUG] The content from {radar_url} is not a valid image.")
+            except Exception as e:
+                print(f"[DEBUG] Image processing error: {e}")
+        else:
+            print(f"[DEBUG] Failed to fetch radar image or response is not an image. Status: {response.status_code}, Content-Type: {response.headers.get('Content-Type')}")
+    except Exception as e:
+        print(f"[DEBUG] Error fetching radar image: {e}")
+    return None
+
+async def send_outlook(channel, day_keys: list):
+    for day_key in day_keys:
+        info = day_data.get(day_key)
+        if not info:
+            continue
+
+        txt_resp = fetch_with_retry(info['text'])
+        if not txt_resp:
+            continue
+        content = txt_resp.text
+
+        old_msg_id = sent_outlooks.get(f"{day_key}_msg")
+        if old_msg_id is not None:
+            try:
+                old_msg = await channel.fetch_message(int(old_msg_id))
+                await old_msg.delete()
+            except Exception as e:
+                print(f"[DEBUG] Failed to delete old message for {day_key}: {e}")
+
+        if sent_outlooks.get(day_key) == content:
+            continue
+
+        match = re.search(r"(MARGINAL|SLIGHT|ENHANCED|MODERATE|HIGH) RISK", content, re.IGNORECASE)
+        if match:
+            lvl = match.group(1).capitalize()
+            emoji, color = risk_icons.get(lvl, ('', 0xCCCCCC))
+            summary = f"{emoji} **{lvl} Risk** of severe thunderstorms."
+            threats = re.findall(r"(tornado|hail|wind).*?(\d{1,2}%|significant)", content, re.IGNORECASE)
+            details = '\n'.join(f"• **{t[0].capitalize()}**: {t[1]}" for t in threats)
+        else:
+            lvl = "None"
+            emoji, color = '', 0xCCCCCC
+            summary, details = 'No severe risk mentioned.', ''
+
+        image_url = get_spc_image_url(day_key)
+        img_resp = fetch_with_retry(image_url)
+        if not img_resp:
+            continue
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.gif') as tmp:
+            tmp.write(img_resp.content)
+            tmp_path = tmp.name
+
+        embed = discord.Embed(
+            title=f"{emoji} {day_key} Outlook",
+            description=summary,
+            color=color,
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name='Risk Level', value=lvl, inline=True)
+        if details:
+            embed.add_field(name='Threats', value=details, inline=False)
+        embed.add_field(name='SPC Outlook Link', value=f"[View Outlook Map]({image_url})", inline=False)
+        embed.set_footer(text=datetime.now(timezone.utc).strftime('Last Updated: %Y-%m-%d %H:%M UTC'))
+        file = File(tmp_path, filename=f"{day_key.replace(' ', '').lower()}_outlook.gif")
+        embed.set_image(url=f"attachment://{file.filename}")
+
+        message = await channel.send(embed=embed, file=file)
+        os.remove(tmp_path)
+
+        sent_outlooks[day_key] = content
+        sent_outlooks[f"{day_key}_msg"] = message.id
+
+@bot.tree.command(name="outlook", description="Get the SPC Outlook for a specific day (1,2,3)")
+@app_commands.describe(day="Choose 1, 2, or 3 for SPC Outlook")
+async def outlook_command(interaction: discord.Interaction, day: str):
+    key = f"Day {day}"
+    if key in day_data:
+        await interaction.response.send_message(f"Fetching Outlook {key}...", ephemeral=True)
+        await send_outlook(interaction.channel, [key])
+    else:
+        await interaction.response.send_message("Invalid day. Use 1, 2, or 3.", ephemeral=True)
+
+@tasks.loop(seconds=30)
+async def outlook_loop():
+    channel = bot.get_channel(OUTLOOK_CHANNEL_ID)
+    if channel:
+        await send_outlook(channel, list(day_data.keys()))
+
+@tasks.loop(seconds=5)
+async def warning_loop():
+    channel = bot.get_channel(WARNING_CHANNEL_ID)
+    if channel:
+        await send_storm_warnings(channel)
+
+async def send_storm_warnings(channel):
+    alerts = fetch_active_alerts()
+    for alert in alerts:
+        alert_id = alert.get('id')
+        if alert_id in sent_warning_ids:
+            continue
+
+        properties = alert.get('properties', {})
+        event = properties.get('event', 'Unknown Event')
+        if event in IMPORTANT_WARNINGS:
+            description = properties.get('description', 'No description available.')
+            area = properties.get('areaDesc', 'Unknown Area')
+            ends = properties.get('ends', 'Unknown')
+            headline = properties.get('headline', '')
+
+            # Ensure the title is no longer than 256 characters
+            title = f"⚠️ {event} - {area}"
+            if len(title) > 256:
+                title = title[:253] + "..."  # Truncate if necessary
+
+            embed = discord.Embed(
+                title=title,
+                description=f"{headline}\n\n{description}\n\n**Expires:** {ends}",
+                color=0xFF0000,
+                timestamp=datetime.now(timezone.utc)
+            )
+
+            radar_img_path = fetch_radar_image(alert)
+            file = None
+            if radar_img_path:
+                file = File(radar_img_path, filename='radar.gif')
+                embed.set_image(url="attachment://radar.gif")
+
+            await channel.send(embed=embed, file=file)
+
+            if radar_img_path:
+                os.remove(radar_img_path)
+
+            sent_warning_ids.add(alert_id)
+
+@bot.event
+async def on_ready():
+    await bot.wait_until_ready()
+    if not outlook_loop.is_running():
+        outlook_loop.start()
+    if not warning_loop.is_running():
+        warning_loop.start()
+    try:
+        synced = await bot.tree.sync()
+        print(f"[DEBUG] Synced {len(synced)} commands")
+    except Exception as e:
+        print(f"[DEBUG] Command sync failed: {e}")
+
+bot.run(TOKEN)
